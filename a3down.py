@@ -30,6 +30,7 @@ import logging
 import subprocess
 import shutil
 import requests
+import shlex
 
 from datetime import datetime
 from bs4 import BeautifulSoup
