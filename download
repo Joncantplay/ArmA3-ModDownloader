@@ -1,0 +1,2 @@
+tmux new-session -d -s armadownload
+tmux a -t armadownload

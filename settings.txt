@@ -1,0 +1,18 @@
+#########
+[DEFAULT]
+#########
+
+STEAM_CMD=steamcmd
+STEAM_USER=NAME
+STEAM_PASS=PASSWORD
+
+SERVER_ID=233780 -beta creatordlc
+SERVER_DIR=/path/to/serverfiles
+HTML_DIR=/path/to/htmlfolder
+MODS_DIR=/path/to/arma/mods
+
+LOG=True
+LOG_DIR=/path/to/logfolder
+LOG_NAME=LOGPREFIXNAME
+
+MAX_TRIES=5
