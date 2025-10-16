@@ -40,7 +40,7 @@ Available Options:
   Perform a complete server update.
 
 - `-u`, `--Update`
-  Execute a standard update.
+  Perform a standard update.
 
 - `-fu`, `--ForceUpdate`
   Forcefully update mods, regardless if needed or not.
@@ -59,6 +59,13 @@ Available Options:
 
 - `-d`, `--debug`
   Enable debugging mode to show which mods require an update and which ones are detected in the HTML file.
+
+- `-r`, `--retry`
+  Retry Failed mods.
+
+- `-sy`, `--symlink`
+  Creating the Mod symlinks.
+
 
 Run `./download` to start a new tmux session to let the update run in background
 
