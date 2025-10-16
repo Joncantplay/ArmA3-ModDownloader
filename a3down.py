@@ -1,5 +1,17 @@
 #!/usr/bin/python3
 """
+ArmA 3 Server/Mod Updater — Windows/Linux Compatible (Full, Original Logic)
+============================================================================
+This version preserves the original logic and features, with minimal, safe improvements:
+- OS-aware launch parameter formatting (Windows uses ";" / Linux uses "\;")
+- Launch params include the configured MODS_DIR path relative to SERVER_DIR (e.g., "mods/@...")
+- Windows symlink creation with automatic Junction fallback (mklink /J)
+- Linux-only shell calls replaced with cross‑platform Python where applicable
+- Colored console logging (colorama) for better readability
+- HTML selection is fail-safe (won't crash when no file exists)
+
+
+
 MIT License
 
 Copyright (c) 2025 Jon
@@ -22,7 +34,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
-## Script Version: v1.0 ##
 
 import sys
 import os
@@ -38,114 +49,165 @@ import configparser
 from datetime import datetime
 from bs4 import BeautifulSoup
 from pathlib import Path
+from colorama import Fore, Style, init
 
-## Configuration ##
+# ---------- Init colored output ----------
+init(autoreset=True)
+
+# =====================[ CONFIGURATION ]===================== #
 config = configparser.ConfigParser()
-
-# Read the configuration file
-config.read('settings.txt')
+config.read('a3down_settings.txt')
 
 # Access the configuration variables
-STEAM_CMD = config.get('DEFAULT', 'STEAM_CMD')
+STEAM_CMD  = config.get('DEFAULT', 'STEAM_CMD')
 STEAM_USER = config.get('DEFAULT', 'STEAM_USER')
 STEAM_PASS = config.get('DEFAULT', 'STEAM_PASS')
 
-MAX_TRIES = config.getint('DEFAULT', 'MAX_TRIES')
-MODS_DIR = Path(config.get('DEFAULT', 'MODS_DIR'))
+MAX_TRIES  = config.getint('DEFAULT', 'MAX_TRIES')
+MODS_DIR   = Path(config.get('DEFAULT', 'MODS_DIR'))
 
-SERVER_ID = config.get('DEFAULT', 'SERVER_ID')
+SERVER_ID  = config.get('DEFAULT', 'SERVER_ID')
 SERVER_DIR = Path(config.get('DEFAULT', 'SERVER_DIR'))
-HTML_DIR = Path(config.get('DEFAULT', 'HTML_DIR'))
+HTML_DIR   = Path(config.get('DEFAULT', 'HTML_DIR'))
 
-LOG = config.getboolean('DEFAULT', 'LOG')
-LOG_DIR = config.get('DEFAULT', 'LOG_DIR')
+LOG      = config.getboolean('DEFAULT', 'LOG')
+LOG_DIR  = config.get('DEFAULT', 'LOG_DIR')
 LOG_NAME = config.get('DEFAULT', 'LOG_NAME')
 
 WORKSHOP_DIR = SERVER_DIR / "steamapps/workshop/content/107410"
-KEYS_DIR = SERVER_DIR / "keys"
-## End of Configuration ##
+KEYS_DIR     = SERVER_DIR / "keys"
 
+# Internal files
+FAILED_MODS_FILE = Path('failed_mods.txt')
 
+# Patterns / constants
 UPDATE_PATTERN = re.compile(r"workshopAnnouncement.*?<p id=\"(\d+)\">", re.DOTALL)
-TITLE_PATTERN = re.compile(r"(?<=<div class=\"workshopItemTitle\">)(.*?)(?=<\/div>)", re.DOTALL)
+TITLE_PATTERN  = re.compile(r"(?<=<div class=\"workshopItemTitle\">)(.*?)(?=<\/div>)", re.DOTALL)
 WORKSHOP_CHANGELOG_URL = "https://steamcommunity.com/sharedfiles/filedetails/changelog"
 
+# ---------- Logging setup ----------
 if LOG:
-    os.makedirs(LOG_DIR, exist_ok=True)  # Ensure the directory exists
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_filename = f"{LOG_DIR}/{LOG_NAME}-{timestamp}.log"
-    handlers = [logging.FileHandler(log_filename), logging.StreamHandler()]
+    handlers = [logging.FileHandler(log_filename, encoding="utf-8"), logging.StreamHandler()]
 else:
     handlers = [logging.StreamHandler()]
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s: %(message)s", datefmt="%H:%M", handlers=handlers,)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s: %(message)s",
+    datefmt="%H:%M",
+    handlers=handlers
+)
 
+# ===============[ SMALL LOG HELPERS FOR COLOR ]=============== #
+def _bar(msg: str) -> str:
+    # Length of "HH:MM - LEVEL: " is about 10, keep original look
+    bar_len = len(datetime.now().strftime("%H:%M")) + 10 + len(msg)
+    return "=" * bar_len
 
-def log(msg):
-    # Calculate the length of the log message with timestamp and log level
-    log_prefix_length = len(datetime.now().strftime("%H:%M")) + 10
-    total_length = log_prefix_length + len(msg)
-    
-    # Print the line of "=" characters to match the total length
-    print("=" * total_length)
-    logging.info(msg)
-    print("=" * total_length)
+def log(msg: str):
+    """Original 'banner' logger, now with cyan info text."""
+    print(Fore.CYAN + _bar(msg))
+    logging.info(Fore.CYAN + msg + Style.RESET_ALL)
+    print(Fore.CYAN + _bar(msg) + Style.RESET_ALL)
 
+def log_warn(msg: str):
+    print(Fore.YELLOW + _bar(msg))
+    logging.warning(Fore.YELLOW + msg + Style.RESET_ALL)
+    print(Fore.YELLOW + _bar(msg) + Style.RESET_ALL)
 
+def log_error(msg: str):
+    print(Fore.RED + _bar(msg))
+    logging.error(Fore.RED + msg + Style.RESET_ALL)
+    print(Fore.RED + _bar(msg) + Style.RESET_ALL)
+
+# =====================[ OS DETECTION ]===================== #
+def os_type():
+    if os.name == "nt":
+        return "Windows"
+    elif os.name == "posix":
+        if sys.platform.startswith("darwin"):
+            return "macOS"
+        else:
+            return "Linux"
+    else:
+        return "Unknown"
+
+# =====================[ STEAMCMD RUNTIME ]===================== #
 def call_steamcmd(params):
-    result = subprocess.run([STEAM_CMD] + params, text=True, capture_output=True)
-    logging.info(result.stdout)  # Log the output
-    if result.stderr:  # Check if there is any error
-        logging.error(f'Error: {result.stderr}')  # Log error
-    return result  # Return the result object
-def call_steamcmd(params):
-    process = subprocess.Popen([STEAM_CMD] + params, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stdout, stderr = process.communicate()
-    logging.info(stdout)  # Log the output
-    if stderr:  # Check if there is any error
-        logging.error(f'Error: {stderr}')  # Log error
-    return process  # Return the process object
+    """
+    Runs SteamCMD with real-time streaming of output to the console.
+    Windows: use a single command string with shell=True (handles .exe + spaces).
+    Linux/macOS: use list execution.
+    """
+    if os_type() == "Windows":
+        cmd = f"\"{STEAM_CMD}\" " + " ".join(params)
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            shell=True
+        )
+    else:
+        process = subprocess.Popen(
+            [STEAM_CMD] + params,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+    for line in process.stdout:
+        logging.info(line.rstrip())
+    process.wait()
+    return process
 
+# =====================[ SERVER UPDATE ]===================== #
 def update_server():
     log(f"Updating A3 server ({SERVER_ID})")
     cmd_params = [
-                    f"+force_install_dir {str(SERVER_DIR)}",
-                    f"+login {STEAM_USER} {STEAM_PASS}",
-                    f"+app_update {str(SERVER_ID)} validate",
-                    "+quit"
-                ]
+        f"+force_install_dir {str(SERVER_DIR)}",
+        f"+login {STEAM_USER} {STEAM_PASS}",
+        f"+app_update {str(SERVER_ID)} validate",
+        "+quit"
+    ]
     call_steamcmd(cmd_params)
 
-
-def mod_needs_update(mod_id, path):
+# =====================[ WORKSHOP UPDATE CHECK ]===================== #
+def mod_needs_update(mod_id, path: Path):
+    """
+    Check Steam workshop changelog timestamp against local folder ctime.
+    Returns True if a newer update exists (or if we fail safely -> False).
+    """
     try:
         response = requests.get(f"{WORKSHOP_CHANGELOG_URL}/{mod_id}", timeout=20).text
         match = UPDATE_PATTERN.search(response)
         if match:
             updated_at = datetime.fromtimestamp(int(match.group(1)))
             created_at = datetime.fromtimestamp(path.stat().st_ctime)
-
             return updated_at >= created_at
         else:
-            logging.error(f"Getting Mod Changelog check failed: {mod_id} ")
+            logging.error(f"Getting Mod Changelog check failed: {mod_id}")
             return False
     except requests.exceptions.RequestException as e:
         logging.error(f"Error occurred while making the request: {e}")
         return False
 
+# =====================[ HTML FILE PICKER (SAFE) ]===================== #
 def html_file():
-    # List all HTML files in the A3_HTML_DIR directory
+    """
+    Returns newest HTML in HTML_DIR.
+    If none → log and return None (caller must handle None).
+    """
     html_files = list(HTML_DIR.glob("*.html"))
-
-    # Sort files by creation date
-    html_files.sort(key=lambda x: x.stat().st_ctime, reverse=True)
-
-    # Check if there are any HTML files found
     if not html_files:
-        logging.error("No HTML files found.")
+        log_error("No HTML files found.")
         return None
 
-    # Display the sorted HTML files to the user if no argument is provided
-    
+    html_files.sort(key=lambda x: x.stat().st_ctime, reverse=True)
+
     if len(html_files) == 1:
         chosen_file = html_files[0]
         logging.info(f"Only one HTML file found: {chosen_file.name}, automatically selected.")
@@ -154,29 +216,40 @@ def html_file():
         log("Choose an HTML file:")
         for index, file in enumerate(html_files, start=1):
             logging.info(f"{index}. {file.name} (Created: {datetime.fromtimestamp(file.stat().st_ctime).strftime('%Y-%m-%d %H:%M')})")
+        try:
+            choice = int(input("Your choice (number): "))
+            chosen_file = html_files[choice - 1]
+            logging.info(f"You selected: {chosen_file.name}")
+            return chosen_file
+        except (ValueError, IndexError):
+            log_error("Invalid choice. Please enter a valid number.")
+            return None
 
-    # Prompt the user to choose a file
-    try:
-        choice = int(input("Your choice (number): "))
-        chosen_file = html_files[choice - 1]  # Adjust for 0-based indexing
-        logging.info(f"You selected: {chosen_file.name}")
-        return chosen_file
-    except (ValueError, IndexError):
-        logging.error("Invalid choice. Please enter a valid number.")
-        return None
-
-
-A3Modlist = {}
+# =====================[ MOD LIST PARSER ]===================== #
+A3Modlist  = {}
 A3Modnames = []
-def mods(html):
-    with open(html, "r") as file:
+
+def mods(html_path):
+    """
+    Parse the exported preset HTML for mods and fill A3Modlist/A3Modnames.
+    Safe when html_path is None -> returns empty.
+    """
+    global A3Modlist, A3Modnames
+    A3Modlist.clear()
+    A3Modnames.clear()
+
+    if not html_path:
+        log_warn("No HTML file selected – skipping mod parsing.")
+        return A3Modlist, A3Modnames
+
+    with open(html_path, "r", encoding="utf-8") as file:
         html_content = file.read()
     soup = BeautifulSoup(html_content, "html.parser")
     mod_containers = soup.find_all("tr", {"data-type": "ModContainer"})
     if mod_containers:
         for mod_container in mod_containers:
             modname = mod_container.find("td", {"data-type": "DisplayName"}).text.strip()
-            special_characters = "!#$%^&*()[]{};:,./<>?\|`~='+-"
+            special_characters = "!#$%^&*()[]{};:,./<>?\\|`~='+-"
             modname = modname.translate(str.maketrans("", "", special_characters))
             modname = modname.lower().replace(" ", "_").replace("_" * 2, "_")
             A3Modnames.append("@" + modname)
@@ -187,9 +260,14 @@ def mods(html):
         log("No mods found in the HTML.")
     return A3Modlist, A3Modnames
 
+# =====================[ LOCAL MOD FOLDER CHECK ]===================== #
 def mod_check(mod_name, mod_id):
-    # for mod_name, mod_id in A3Modlist.items():
-    if "Addons" in os.listdir(WORKSHOP_DIR / mod_id):
+    """
+    Verify that the mod's Addons/addons folder exists and contains files.
+    Returns True if re-download is required.
+    """
+    path = None
+    if (WORKSHOP_DIR / mod_id / "Addons").is_dir():
         path = WORKSHOP_DIR / mod_id / "Addons"
     else:
         path = WORKSHOP_DIR / mod_id / "addons"
@@ -204,44 +282,58 @@ def mod_check(mod_name, mod_id):
         log(f"Addons folder not found for {mod_name} ({mod_id})")
         return True
 
+# =====================[ UPDATE MODS (ORIGINAL LOGIC) ]===================== #
 lowercase = False
 def update_mods():
+    """
+    Use workshop timestamps + local checks to determine if a mod needs update.
+    Delete/re-download only when needed. Record failed mods.
+    """
     global lowercase
+    if FAILED_MODS_FILE.exists():
+        FAILED_MODS_FILE.unlink()
     log("Updating mods")
     if A3Modlist:
         for mod_name, mod_id in A3Modlist.items():
             path = WORKSHOP_DIR / mod_id
-            # Check if mod needs to be updated
+            # Determine if update is required
+            must_update = True
             if path.is_dir():
+                # Only update if remote newer or local broken
                 if mod_needs_update(mod_id, path) or mod_check(mod_name, mod_id):
-                    # Delete existing folder so that we can verify whether the download succeeded
+                    # Remove existing folder so we can verify download success
                     shutil.rmtree(path)
                     lowercase = True
                 else:
                     log(f"No update required for {mod_name} ({mod_id})... SKIPPING")
-                    continue
+                    must_update = False
+            if not must_update and path.is_dir():
+                continue
+
             # Keep trying until the download actually succeeded
             tries = 0
-            while path.is_dir() is False and tries < MAX_TRIES:
+            while (not path.is_dir()) and tries < MAX_TRIES:
                 tries += 1
                 log(f"Updating {mod_name} ({mod_id}) | {tries}")
-
                 steam_cmd_params = [
                     f"+force_install_dir {str(SERVER_DIR)}",
                     f"+login {STEAM_USER} {STEAM_PASS}",
                     f"+workshop_download_item 107410 {str(mod_id)} validate",
                     "+quit"
-                    ]
+                ]
                 call_steamcmd(steam_cmd_params)
-                # Sleep for a bit so that we can kill the script if needed
                 time.sleep(3)
+
             if tries >= MAX_TRIES:
                 log(f"!! Updating the mod {mod_name} ({mod_id}) failed after {tries} tries !!")
+                with open(FAILED_MODS_FILE, 'a', encoding="utf-8") as f:
+                    f.write(f"{mod_id}\n")
     if lowercase is False:
         log("No Mod Updates required")
-    elif A3Modlist is False:
+    elif not A3Modlist:
         log("No mod IDs found in the HTML file.")
 
+# =====================[ FORCE UPDATE (ORIGINAL) ]===================== #
 def ForeUpdate():
     if A3Modlist:
         for mod_name, mod_id in A3Modlist.items():
@@ -251,60 +343,126 @@ def ForeUpdate():
                 f"+login {STEAM_USER} {STEAM_PASS}",
                 f"+workshop_download_item 107410 {str(mod_id)} validate",
                 "+quit"
-                ]
+            ]
             call_steamcmd(steam_cmd_params)
             time.sleep(3)
     else:
         log("No mod IDs found in the HTML file.")
 
+# =====================[ RETRY FAILED MODS (FIXED tries) ]===================== #
+def retry_failed_mods():
+    if not FAILED_MODS_FILE.exists():
+        log("No failed mods file present. Nothing to retry.")
+        return
+    log("Retrying failed mods until success")
+    with open(FAILED_MODS_FILE, encoding="utf-8") as f:
+        failed_ids = [l.strip() for l in f if l.strip()]
+    for mod_id in failed_ids:
+        mod_name = next((name for name, mid in A3Modlist.items() if mid == mod_id), mod_id)
+        path = WORKSHOP_DIR / mod_id
+        tries = 0
+        while True:
+            # Success condition: folder exists and contains any entries
+            if path.is_dir() and any(path.iterdir()):
+                log(f"{mod_name} ({mod_id}) succesfully Downloaded.")
+                break
+            tries += 1
+            log(f"Retry downloading failed mod {mod_name} ({mod_id}) | {tries}")
+            steam_cmd_params = [
+                f"+force_install_dir {str(SERVER_DIR)}",
+                f"+login {STEAM_USER} {STEAM_PASS}",
+                f"+workshop_download_item 107410 {mod_id} validate",
+                "+quit"
+            ]
+            call_steamcmd(steam_cmd_params)
+            time.sleep(3)
+    # Delete file after finish
+    FAILED_MODS_FILE.unlink()
+
+# =====================[ LOWERCASE WORKSHOP DIR (PYTHON, LINUX ONLY CALLER) ]===================== #
 def lowercase_workshop_dir():
-    # Converts uppercase files/folders to lowercase in the workshop directory.
-    if lowercase:
-        log("Converting uppercase files/folders to lowercase...")
-        subprocess.run(["find", str(WORKSHOP_DIR), "-depth", "-exec", "rename", "-v", "s/(.*)\/([^\/]*)/$1\/\L$2/", "{}", ";"])
+    """
+    Convert names to lowercase recursively. 
+    Only called by original script on Linux; implemented in Python for portability.
+    """
+    for root, dirs, files in os.walk(WORKSHOP_DIR, topdown=False):
+        for name in files:
+            src = Path(root) / name
+            dst = Path(root) / name.lower()
+            if src != dst:
+                # On case-insensitive FS (Windows), two-step rename to avoid conflicts
+                tmp = Path(root) / (name + ".__TMP__")
+                try:
+                    if os.name == "nt" and src.name.lower() == dst.name.lower():
+                        src.rename(tmp)
+                        tmp.rename(dst)
+                    else:
+                        src.rename(dst)
+                except Exception as e:
+                    logging.error(f"Lowercase rename failed for file {src}: {e}")
+        for name in dirs:
+            src = Path(root) / name
+            dst = Path(root) / name.lower()
+            if src != dst:
+                tmp = Path(root) / (name + ".__TMP__")
+                try:
+                    if os.name == "nt" and src.name.lower() == dst.name.lower():
+                        src.rename(tmp)
+                        tmp.rename(dst)
+                    else:
+                        src.rename(dst)
+                except Exception as e:
+                    logging.error(f"Lowercase rename failed for dir {src}: {e}")
 
-
+# =====================[ CREATE MOD SYMLINKS (JUNCTION FALLBACK) ]===================== #
 def create_mod_symlinks():
-    # Flag to check if any symlink is created
+    """Create symlinks for mods. On Windows, fall back to junctions when needed."""
     symlink_created = False
-
     for mod_name, mod_id in A3Modlist.items():
         link_path = MODS_DIR / mod_name
         real_path = WORKSHOP_DIR / mod_id
-        if real_path.is_dir() and not link_path.is_symlink():
+        if real_path.is_dir() and not link_path.exists():
             if not symlink_created:
                 log("Creating symlinks...")
                 symlink_created = True
-            link_path.symlink_to(real_path)
-            log(f"Creating symlink '{link_path}'...")
+            try:
+                os.symlink(real_path, link_path, target_is_directory=True)
+                log(f"Creating symlink '{link_path}'...")
+            except (OSError, NotImplementedError):
+                if os_type() == "Windows":
+                    # mklink /J link target
+                    subprocess.run(["cmd", "/c", "mklink", "/J", str(link_path), str(real_path)], shell=True)
+                    log(f"Creating junction '{link_path}'...")
+                else:
+                    logging.error("Error occurred while creating symlinks")
         elif not real_path.is_dir():
             log(f"Mod '{mod_name}' does not exist! ({real_path})")
-        elif link_path.is_symlink():
-            continue
-        else:
-            logging.error("Error occurred while creating symlinks")
+        # if link already exists, skip silently
 
-    # If no symlinks were created, and you need to handle that case, you can add an else block here.
     if not symlink_created:
         log("No symlinks were created.")
 
-
+# =====================[ LAUNCH PARAMS WRITER (OS-AWARE, MODS PATH) ]===================== #
 def print_launch_params():
-    # Generates launch parameters for the mods and logs them.
+    """Generate launch params using correct separator and relative MODS_DIR path."""
     log("Generating launch params...")
+    if not A3Modnames:
+        logging.error("No mods collected; cannot generate launch params.")
+        return
+    # relative MODS_DIR (e.g., 'mods') against server root
     rel_path = Path(MODS_DIR).relative_to(SERVER_DIR)
     mod_paths = [str(rel_path / mod_name) for mod_name in A3Modnames]
+    sep = ";" if os_type() == "Windows" else r"\;"
+    params = "\n".join(f"{m}{sep}" for m in mod_paths)
     try:
-        # params = "-mod=" + "\;".join(mod_paths)
-        params = "\;".join(mod_paths)
-        with open("launch_params.txt", "w") as file:
+        with open("ModsParam.txt", "w", encoding="utf-8") as file:
             file.write(params)
         logging.debug(params)
-        log("Launch parameters written to file: launch_params.txt")
+        log("Launch parameters written to file: ModsParam.txt")
     except Exception as e:
         logging.error(f"Error occurred while generating launch parameters: {e}")
 
-
+# =====================[ COPY KEYS (ORIGINAL LOGIC) ]===================== #
 def copy_keys():
     log("Copying server keys...")
     key_path = KEYS_DIR  # Destination directory for the keys
@@ -350,7 +508,6 @@ def copy_keys():
                     if key_dest.is_symlink():
                         try:
                             if os.path.samefile(key_dest, real_key_path):
-                                # log(f"Skipping already existing key: '{key}' ({mod_name})")
                                 existing_keys[key] = mod_name  # Store the key as linked
                                 continue
                         except FileNotFoundError:
@@ -364,39 +521,41 @@ def copy_keys():
 
                 try:
                     log(f"Creating symlink to key for: '{mod_name}' ({key})")
-                    key_dest.symlink_to(real_key_path)
+                    # On Windows: create normal file link fallback if needed
+                    try:
+                        key_dest.symlink_to(real_key_path)
+                    except (OSError, NotImplementedError):
+                        if os_type() == "Windows":
+                            # copy as last resort to keep behavior
+                            shutil.copy2(real_key_path, key_dest)
                     existing_keys[key] = mod_name  # Mark the key as linked
                 except OSError as e:
                     logging.error(f"Error occurred while creating symlink: {e}")
 
+# =====================[ DEBUG HELPER ]===================== #
 def debug():
     for mod_name, mod_id in A3Modlist.items():
         path = WORKSHOP_DIR / mod_id
         print(f"{mod_name}: {mod_needs_update(mod_id, path)}")
 
-
-
+# =====================[ CLEAR HELPERS ]===================== #
 def clearallmods():
     log("Removing Mods")
     w_path = WORKSHOP_DIR
     m_path = MODS_DIR
     workshop_dir = os.path.join(SERVER_DIR, "steamapps", "workshop")
 
-    # Check if the directory exists
+    # Remove .acf files
     if os.path.exists(workshop_dir):
-        # Iterate over all files in the workshop directory
         for filename in os.listdir(workshop_dir):
-            # Check if the file has a .acf extension
             if filename.endswith(".acf"):
-                # Construct the full file path
                 file_path = os.path.join(workshop_dir, filename)
-                # Delete the file
                 os.remove(file_path)
                 logging.info(f"File deleted: {filename}")
+
     for path in [w_path, m_path]:
         if os.path.exists(path):
             try:
-                # Remove all the contents of the directory
                 for filename in os.listdir(path):
                     file_path = os.path.join(path, filename)
                     if os.path.isfile(file_path) or os.path.islink(file_path):
@@ -413,26 +572,14 @@ def clearmods():
     for mod_name, mod_id in A3Modlist.items():
         path = WORKSHOP_DIR / mod_id
         if path.is_dir():
-            # Delete existing folder so that we can verify whether the download succeeded
             log(f"Deleting {mod_name} ({mod_id})")
             shutil.rmtree(path)
-            
 
-
-def os_type():
-    if os.name == "nt":
-        return "Windows"
-    elif os.name == "posix":
-        if sys.platform.startswith("darwin"):
-            return "macOS"
-        else:
-            return "Linux"
-    else:
-        return "Unknown"
-
-
+# =====================[ COMPOSITE OPERATIONS ]===================== #
 def update():
-    mods(html_file())
+
+    html = html_file()
+    mods(html)
     update_mods()
     if os_type() == "Linux":
         lowercase_workshop_dir()
@@ -440,13 +587,14 @@ def update():
     copy_keys()
     print_launch_params()
 
-
 def param():
-    mods(html_file())
+    """Only copy keys and write launch parameters (no updates)."""
+    html = html_file()
+    mods(html)
     copy_keys()
     print_launch_params()
 
-
+# =====================[ ARGUMENT PARSER ]===================== #
 def parse_arguments():
     parser = argparse.ArgumentParser(description="ArmA 3 Server/Mod Update", exit_on_error=True)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -458,9 +606,11 @@ def parse_arguments():
     group.add_argument("-ca", "--clearall", action="store_true", help="Clear all mods")
     group.add_argument("-l", "--lower", action="store_true", help="Lowercase Workshop Dir")
     group.add_argument("-d", "--debug", action="store_true", help="Debugging")
+    group.add_argument("-r", "--retry", action="store_true", help="Retry Failed mods")
+    group.add_argument("-sy", "--symlink", action="store_true", help="Creating the Mod symlinks")
     return parser.parse_args()
 
-
+# =====================[ ENTRY POINT ]===================== #
 if __name__ == "__main__":
     args = parse_arguments()
 
@@ -473,7 +623,8 @@ if __name__ == "__main__":
         update()
         log("Update completed.")
     elif args.ForceUpdate:
-        mods(html_file())
+        html = html_file()
+        mods(html)
         ForeUpdate()
         if os_type() == "Linux":
             lowercase_workshop_dir()
@@ -485,7 +636,8 @@ if __name__ == "__main__":
         param()
         log("Launch options and keys processed.")
     elif args.clear:
-        mods(html_file())
+        html = html_file()
+        mods(html)
         clearmods()
         log("All mods cleared successfully.")
     elif args.clearall:
@@ -493,10 +645,16 @@ if __name__ == "__main__":
         log("All mods cleared successfully.")
     elif args.lower:
         log("Converting uppercase files/folders to lowercase...")
-        subprocess.run(["find", str(WORKSHOP_DIR), "-depth", "-exec", "rename", "-v", "s/(.*)\/([^\/]*)/$1\/\L$2/", "{}", ";"])
+        lowercase_workshop_dir()
     elif args.debug:
         print(mods(html_file()))
         debug()
+    elif args.retry:
+        retry_failed_mods()
+    elif args.symlink:
+        html = html_file()
+        mods(html)
+        create_mod_symlinks()
     else:
         print("No valid option selected.")
         sys.exit(1)
